@@ -252,3 +252,104 @@
     (ok true)
   )
 )
+
+
+(define-public (get-volunteer-credits (volunteer principal))
+  (let ((volunteer-data (unwrap! (map-get? volunteers { volunteer: volunteer }) (err ERR-VOLUNTEER-NOT-FOUND))))
+    (ok (get credits-balance volunteer-data))
+  )
+)
+(define-public (get-volunteer-hours (volunteer principal))
+  (let ((volunteer-data (unwrap! (map-get? volunteers { volunteer: volunteer }) (err ERR-VOLUNTEER-NOT-FOUND))))
+    (ok {
+      total-hours: (get total-hours volunteer-data),
+      verified-hours: (get verified-hours volunteer-data)
+    })
+  )
+)
+(define-public (get-organization-hours (org-id principal))
+  (let ((org-data (unwrap! (map-get? organizations { org-id: org-id }) (err ERR-ORGANIZATION-NOT-FOUND))))
+    (ok {
+      total-hours-verified: (get total-hours-verified org-data)
+    })
+  )
+)
+
+(define-public (get-volunteer-activity (activity-id uint))
+  (let ((activity (unwrap! (map-get? volunteer-activities { activity-id: activity-id }) (err ERR-NOT-FOUND))))
+    (ok activity)
+  )
+)
+
+(define-constant CREDIT-EXPIRY-BLOCKS u52560)
+
+(define-map credit-expiry
+  { volunteer: principal }
+  { expiry-height: uint }
+)
+
+(define-public (update-credit-expiry (volunteer principal))
+  (let ((current-block-height stacks-block-height))
+    (map-set credit-expiry
+      { volunteer: volunteer }
+      { expiry-height: (+ current-block-height CREDIT-EXPIRY-BLOCKS) }
+    )
+    (ok true)
+  )
+)
+
+(define-public (check-and-expire-credits (volunteer principal))
+  (let (
+    (current-block-height stacks-block-height)
+    (expiry-data (unwrap! (map-get? credit-expiry { volunteer: volunteer }) (err ERR-NOT-FOUND)))
+    (volunteer-data (unwrap! (map-get? volunteers { volunteer: volunteer }) (err ERR-VOLUNTEER-NOT-FOUND)))
+  )
+    (if (>= current-block-height (get expiry-height expiry-data))
+      (begin
+        (map-set volunteers
+          { volunteer: volunteer }
+          (merge volunteer-data { credits-balance: u0 })
+        )
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-map volunteer-badges
+  { volunteer: principal }
+  {
+    bronze: bool,
+    silver: bool,
+    gold: bool
+  }
+)
+
+(define-constant BRONZE-THRESHOLD u50)
+(define-constant SILVER-THRESHOLD u100)
+(define-constant GOLD-THRESHOLD u200)
+
+(define-public (check-and-award-badges (volunteer principal))
+  (let (
+    (volunteer-data (unwrap! (map-get? volunteers { volunteer: volunteer }) (err ERR-VOLUNTEER-NOT-FOUND)))
+    (verified-hours (get verified-hours volunteer-data))
+  )
+    (map-set volunteer-badges
+      { volunteer: volunteer }
+      {
+        bronze: (>= verified-hours BRONZE-THRESHOLD),
+        silver: (>= verified-hours SILVER-THRESHOLD),
+        gold: (>= verified-hours GOLD-THRESHOLD)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-volunteer-badges (volunteer principal))
+  (match (map-get? volunteer-badges { volunteer: volunteer })
+    badges (ok badges)
+    (err ERR-VOLUNTEER-NOT-FOUND)
+  )
+)

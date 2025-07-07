@@ -358,8 +358,12 @@
 
 (define-constant ERR-INVALID-LIMIT (err u201))
 (define-constant ERR-INVALID-PERIOD (err u202))
+(define-constant ERR-REWARD-NOT-FOUND (err u203))
+(define-constant ERR-REWARD-UNAVAILABLE (err u204))
+(define-constant ERR-ALREADY-REDEEMED (err u205))
 
 (define-data-var leaderboard-update-height uint u0)
+(define-data-var reward-counter uint u0)
 
 (define-map volunteer-rankings
   { volunteer: principal }
@@ -388,6 +392,28 @@
     verified-hours: uint,
     credits-balance: uint,
     activities-count: uint
+  }
+)
+
+(define-map marketplace-rewards
+  { reward-id: uint }
+  {
+    organization: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 200),
+    cost: uint,
+    quantity: uint,
+    redeemed: uint,
+    active: bool,
+    created-at: uint
+  }
+)
+
+(define-map volunteer-redemptions
+  { volunteer: principal, reward-id: uint }
+  {
+    redeemed-at: uint,
+    quantity: uint
   }
 )
 
@@ -639,4 +665,104 @@
       (ok true)
     )
   )
+)
+
+(define-public (create-reward (title (string-ascii 100)) (description (string-ascii 200)) (cost uint) (quantity uint))
+  (let ((reward-id (var-get reward-counter)))
+    (asserts! (not (var-get paused)) (err ERR-CONTRACT-PAUSED))
+    (asserts! (match (map-get? organizations { org-id: tx-sender })
+      org-data (get verified org-data)
+      false) (err ERR-NOT-AUTHORIZED))
+    (asserts! (> cost u0) (err ERR-INVALID-HOURS))
+    (asserts! (> quantity u0) (err ERR-INVALID-HOURS))
+    
+    (map-set marketplace-rewards
+      { reward-id: reward-id }
+      {
+        organization: tx-sender,
+        title: title,
+        description: description,
+        cost: cost,
+        quantity: quantity,
+        redeemed: u0,
+        active: true,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (var-set reward-counter (+ reward-id u1))
+    (ok reward-id)
+  )
+)
+
+(define-public (redeem-reward (reward-id uint) (quantity uint))
+  (let (
+    (reward (unwrap! (map-get? marketplace-rewards { reward-id: reward-id }) (err ERR-REWARD-NOT-FOUND)))
+    (volunteer-data (unwrap! (map-get? volunteers { volunteer: tx-sender }) (err ERR-VOLUNTEER-NOT-FOUND)))
+    (total-cost (* (get cost reward) quantity))
+    (available-quantity (- (get quantity reward) (get redeemed reward)))
+  )
+    (asserts! (not (var-get paused)) (err ERR-CONTRACT-PAUSED))
+    (asserts! (get active reward) (err ERR-REWARD-UNAVAILABLE))
+    (asserts! (>= available-quantity quantity) (err ERR-REWARD-UNAVAILABLE))
+    (asserts! (>= (get credits-balance volunteer-data) total-cost) (err ERR-INSUFFICIENT-BALANCE))
+    
+    (map-set volunteers
+      { volunteer: tx-sender }
+      (merge volunteer-data {
+        credits-balance: (- (get credits-balance volunteer-data) total-cost)
+      })
+    )
+    
+    (map-set marketplace-rewards
+      { reward-id: reward-id }
+      (merge reward {
+        redeemed: (+ (get redeemed reward) quantity)
+      })
+    )
+    
+    (map-set volunteer-redemptions
+      { volunteer: tx-sender, reward-id: reward-id }
+      {
+        redeemed-at: stacks-block-height,
+        quantity: quantity
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-reward (reward-id uint))
+  (let ((reward (unwrap! (map-get? marketplace-rewards { reward-id: reward-id }) (err ERR-REWARD-NOT-FOUND))))
+    (asserts! (not (var-get paused)) (err ERR-CONTRACT-PAUSED))
+    (asserts! (is-eq tx-sender (get organization reward)) (err ERR-NOT-AUTHORIZED))
+    
+    (map-set marketplace-rewards
+      { reward-id: reward-id }
+      (merge reward { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-reward (reward-id uint))
+  (match (map-get? marketplace-rewards { reward-id: reward-id })
+    reward (ok reward)
+    (err ERR-REWARD-NOT-FOUND)
+  )
+)
+
+(define-read-only (get-volunteer-redemption (volunteer principal) (reward-id uint))
+  (match (map-get? volunteer-redemptions { volunteer: volunteer, reward-id: reward-id })
+    redemption (ok redemption)
+    (err ERR-NOT-FOUND)
+  )
+)
+
+(define-read-only (get-marketplace-stats)
+  (ok {
+    total-rewards: (var-get reward-counter),
+    total-volunteers: (var-get total-volunteers)
+  })
 )

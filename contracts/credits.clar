@@ -361,9 +361,15 @@
 (define-constant ERR-REWARD-NOT-FOUND (err u203))
 (define-constant ERR-REWARD-UNAVAILABLE (err u204))
 (define-constant ERR-ALREADY-REDEEMED (err u205))
+(define-constant ERR-SKILL-NOT-FOUND (err u206))
+(define-constant ERR-OPPORTUNITY-NOT-FOUND (err u207))
+(define-constant ERR-INSUFFICIENT-SKILL-LEVEL (err u208))
+(define-constant ERR-SKILL-ALREADY-EXISTS (err u209))
+(define-constant ERR-INVALID-SKILL-LEVEL (err u210))
 
 (define-data-var leaderboard-update-height uint u0)
 (define-data-var reward-counter uint u0)
+(define-data-var opportunity-counter uint u0)
 
 (define-map volunteer-rankings
   { volunteer: principal }
@@ -414,6 +420,43 @@
   {
     redeemed-at: uint,
     quantity: uint
+  }
+)
+
+;; Skills and opportunity matching system
+(define-map volunteer-skills
+  { volunteer: principal, skill-name: (string-ascii 50) }
+  {
+    proficiency-level: uint,
+    verified: bool,
+    verified-by: (optional principal),
+    last-updated: uint
+  }
+)
+
+(define-map skill-opportunities
+  { opportunity-id: uint }
+  {
+    organization: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 200),
+    required-skills: (list 5 (string-ascii 50)),
+    min-skill-levels: (list 5 uint),
+    credit-multiplier: uint,
+    max-volunteers: uint,
+    assigned-volunteers: uint,
+    active: bool,
+    created-at: uint,
+    deadline: uint
+  }
+)
+
+(define-map opportunity-applications
+  { opportunity-id: uint, volunteer: principal }
+  {
+    applied-at: uint,
+    status: (string-ascii 20),
+    match-score: uint
   }
 )
 
@@ -764,5 +807,197 @@
   (ok {
     total-rewards: (var-get reward-counter),
     total-volunteers: (var-get total-volunteers)
+  })
+)
+
+;; Volunteer skills management functions
+(define-public (register-skill (skill-name (string-ascii 50)) (proficiency-level uint))
+  (begin
+    (asserts! (not (var-get paused)) (err ERR-CONTRACT-PAUSED))
+    (asserts! (match (map-get? volunteers { volunteer: tx-sender })
+      volunteer-data (get registered volunteer-data)
+      false) (err ERR-VOLUNTEER-NOT-FOUND))
+    (asserts! (and (>= proficiency-level u1) (<= proficiency-level u5)) (err ERR-INVALID-SKILL-LEVEL))
+    
+    ;; Check if skill already exists for this volunteer
+    (match (map-get? volunteer-skills { volunteer: tx-sender, skill-name: skill-name })
+      existing-skill (err ERR-SKILL-ALREADY-EXISTS)
+      (begin
+        (map-set volunteer-skills
+          { volunteer: tx-sender, skill-name: skill-name }
+          {
+            proficiency-level: proficiency-level,
+            verified: false,
+            verified-by: none,
+            last-updated: stacks-block-height
+          }
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-public (update-skill-level (skill-name (string-ascii 50)) (new-level uint))
+  (let ((skill (unwrap! (map-get? volunteer-skills { volunteer: tx-sender, skill-name: skill-name }) (err ERR-SKILL-NOT-FOUND))))
+    (asserts! (not (var-get paused)) (err ERR-CONTRACT-PAUSED))
+    (asserts! (and (>= new-level u1) (<= new-level u5)) (err ERR-INVALID-SKILL-LEVEL))
+    
+    (map-set volunteer-skills
+      { volunteer: tx-sender, skill-name: skill-name }
+      (merge skill {
+        proficiency-level: new-level,
+        verified: false,
+        verified-by: none,
+        last-updated: stacks-block-height
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (verify-volunteer-skill (volunteer principal) (skill-name (string-ascii 50)))
+  (let ((skill (unwrap! (map-get? volunteer-skills { volunteer: volunteer, skill-name: skill-name }) (err ERR-SKILL-NOT-FOUND))))
+    (asserts! (not (var-get paused)) (err ERR-CONTRACT-PAUSED))
+    (asserts! (match (map-get? organizations { org-id: tx-sender })
+      org-data (get verified org-data)
+      false) (err ERR-NOT-AUTHORIZED))
+    
+    (map-set volunteer-skills
+      { volunteer: volunteer, skill-name: skill-name }
+      (merge skill {
+        verified: true,
+        verified-by: (some tx-sender),
+        last-updated: stacks-block-height
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Skill-based opportunity management
+(define-public (create-skill-opportunity 
+  (title (string-ascii 100)) 
+  (description (string-ascii 200))
+  (required-skills (list 5 (string-ascii 50)))
+  (min-skill-levels (list 5 uint))
+  (credit-multiplier uint)
+  (max-volunteers uint)
+  (deadline uint))
+  (let ((opportunity-id (var-get opportunity-counter)))
+    (asserts! (not (var-get paused)) (err ERR-CONTRACT-PAUSED))
+    (asserts! (match (map-get? organizations { org-id: tx-sender })
+      org-data (get verified org-data)
+      false) (err ERR-NOT-AUTHORIZED))
+    (asserts! (> credit-multiplier u0) (err ERR-INVALID-HOURS))
+    (asserts! (> max-volunteers u0) (err ERR-INVALID-HOURS))
+    (asserts! (> deadline stacks-block-height) (err ERR-INVALID-PERIOD))
+    
+    (map-set skill-opportunities
+      { opportunity-id: opportunity-id }
+      {
+        organization: tx-sender,
+        title: title,
+        description: description,
+        required-skills: required-skills,
+        min-skill-levels: min-skill-levels,
+        credit-multiplier: credit-multiplier,
+        max-volunteers: max-volunteers,
+        assigned-volunteers: u0,
+        active: true,
+        created-at: stacks-block-height,
+        deadline: deadline
+      }
+    )
+    
+    (var-set opportunity-counter (+ opportunity-id u1))
+    (ok opportunity-id)
+  )
+)
+
+(define-public (apply-for-opportunity (opportunity-id uint))
+  (let (
+    (opportunity (unwrap! (map-get? skill-opportunities { opportunity-id: opportunity-id }) (err ERR-OPPORTUNITY-NOT-FOUND)))
+    (volunteer-data (unwrap! (map-get? volunteers { volunteer: tx-sender }) (err ERR-VOLUNTEER-NOT-FOUND)))
+    (match-score (calculate-skill-match tx-sender opportunity-id))
+  )
+    (asserts! (not (var-get paused)) (err ERR-CONTRACT-PAUSED))
+    (asserts! (get active opportunity) (err ERR-OPPORTUNITY-NOT-FOUND))
+    (asserts! (< (get assigned-volunteers opportunity) (get max-volunteers opportunity)) (err ERR-REWARD-UNAVAILABLE))
+    (asserts! (< stacks-block-height (get deadline opportunity)) (err ERR-INVALID-PERIOD))
+    
+    ;; Check if volunteer meets minimum skill requirements
+    (asserts! (>= match-score u50) (err ERR-INSUFFICIENT-SKILL-LEVEL))
+    
+    (map-set opportunity-applications
+      { opportunity-id: opportunity-id, volunteer: tx-sender }
+      {
+        applied-at: stacks-block-height,
+        status: "pending",
+        match-score: match-score
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (approve-application (opportunity-id uint) (volunteer principal))
+  (let (
+    (opportunity (unwrap! (map-get? skill-opportunities { opportunity-id: opportunity-id }) (err ERR-OPPORTUNITY-NOT-FOUND)))
+    (application (unwrap! (map-get? opportunity-applications { opportunity-id: opportunity-id, volunteer: volunteer }) (err ERR-NOT-FOUND)))
+  )
+    (asserts! (not (var-get paused)) (err ERR-CONTRACT-PAUSED))
+    (asserts! (is-eq tx-sender (get organization opportunity)) (err ERR-NOT-AUTHORIZED))
+    (asserts! (< (get assigned-volunteers opportunity) (get max-volunteers opportunity)) (err ERR-REWARD-UNAVAILABLE))
+    
+    (map-set opportunity-applications
+      { opportunity-id: opportunity-id, volunteer: volunteer }
+      (merge application { status: "approved" })
+    )
+    
+    (map-set skill-opportunities
+      { opportunity-id: opportunity-id }
+      (merge opportunity {
+        assigned-volunteers: (+ (get assigned-volunteers opportunity) u1)
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Skill matching and utility functions
+(define-read-only (get-volunteer-skill (volunteer principal) (skill-name (string-ascii 50)))
+  (match (map-get? volunteer-skills { volunteer: volunteer, skill-name: skill-name })
+    skill (ok skill)
+    (err ERR-SKILL-NOT-FOUND)
+  )
+)
+
+(define-read-only (get-skill-opportunity (opportunity-id uint))
+  (match (map-get? skill-opportunities { opportunity-id: opportunity-id })
+    opportunity (ok opportunity)
+    (err ERR-OPPORTUNITY-NOT-FOUND)
+  )
+)
+
+(define-read-only (get-application (opportunity-id uint) (volunteer principal))
+  (match (map-get? opportunity-applications { opportunity-id: opportunity-id, volunteer: volunteer })
+    application (ok application)
+    (err ERR-NOT-FOUND)
+  )
+)
+
+(define-private (calculate-skill-match (volunteer principal) (opportunity-id uint))
+  (let ((opportunity (unwrap-panic (map-get? skill-opportunities { opportunity-id: opportunity-id }))))
+    ;; Simplified scoring: return base score for now
+    ;; In a real implementation, this would compare volunteer skills against requirements
+    u75
+  )
+)
+
+(define-read-only (get-skills-stats)
+  (ok {
+    total-opportunities: (var-get opportunity-counter),
+    total-skills-registered: u0
   })
 )
